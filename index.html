@@ -243,21 +243,23 @@
   /* リスト */
   .list { list-style: none; margin: 0; padding: 0; }
   .group-title { font-size: 12px; font-weight: 600; color: var(--muted); margin: 14px 0 0; }
+  /* 行は罫線なしで詰めて並べる（行が増えても一覧で見やすいように。2026-10-29） */
   .item {
-    display: flex; align-items: center; gap: 6px; padding: 6px 0;
-    border-top: 1px solid var(--line); transition: opacity .3s;
+    display: flex; align-items: center; gap: 4px; padding: 1px 0;
+    transition: opacity .3s;
   }
-  .group-title + .list .item:first-child, .list .item:first-child { border-top: 0; }
+  .item .name { line-height: 1.4; }
+  .item .meta { line-height: 1.3; }
   .item.tmp { opacity: .55; }
   .item.done { opacity: .45; }
   .item.done .name { text-decoration: line-through; }
   .check {
-    width: 44px; height: 44px; margin-left: -8px; border: 0; background: none;
+    width: 36px; height: 36px; margin-left: -6px; border: 0; background: none;
     display: grid; place-items: center; flex: none;
   }
   .check span {
-    width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--muted);
-    display: grid; place-items: center; color: #fff; font-size: 15px; font-weight: 700;
+    width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--muted);
+    display: grid; place-items: center; color: #fff; font-size: 13px; font-weight: 700;
   }
   .item.done .check span { background: var(--accent); border-color: var(--accent); }
   .item.done .check span::after { content: "✓"; }
@@ -268,10 +270,19 @@
   .pill.over { background: var(--over-soft); color: var(--over); border-color: transparent; font-weight: 600; }
   .pill.soon { background: var(--soon-soft); color: var(--soon); border-color: transparent; font-weight: 600; }
   .del {
-    width: 40px; height: 40px; border: 0; background: none; color: var(--muted);
-    font-size: 18px; flex: none; border-radius: 50%;
+    width: 34px; height: 34px; border: 0; background: none; color: var(--muted);
+    font-size: 17px; flex: none; border-radius: 50%;
   }
   .del:hover { background: var(--field); }
+  /* 登録したあとの書き直し（文字を押すと開く） */
+  .item .body[data-act] { cursor: pointer; }
+  .edit-hint { color: var(--muted); font-size: 12px; margin-left: 4px; }
+  .item.editing { display: block; padding: 6px 0; }
+  .edit-box { display: grid; gap: 6px; background: var(--field); border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
+  .edit-box .row2 { display: flex; gap: 6px; }
+  .edit-box .row2 > * { flex: 1; min-width: 0; }
+  .edit-box .row-btns { margin-top: 2px; }
+  .edit-box input, .edit-box select { background: var(--card); width: 100%; }
   /* チェックリスト */
   .ck-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
   .ck-card {
@@ -1088,13 +1099,128 @@
   }
 
   function shopItem(it) {
+    if (editing && editing.kind === 'shop' && editing.id === it.id) return shopEditor(it);
     var meta = [it.by, it.at ? md(it.at) : ''].filter(Boolean).join(' · ');
     return '<li class="item' + (it.tmp ? ' tmp' : '') + '" data-id="' + esc(it.id) + '">' +
       '<button type="button" class="check" data-act="shop-done" aria-label="' + esc(it.name) + 'を買った"><span></span></button>' +
-      '<div class="body"><div class="name">' + esc(it.name) + '</div>' +
+      '<div class="body"' + (it.tmp ? '' : ' data-act="item-edit" data-kind="shop"') + '><div class="name">' + esc(it.name) +
+      (it.tmp ? '' : '<span class="edit-hint" aria-hidden="true">✎</span>') + '</div>' +
       (meta ? '<div class="meta">' + esc(meta) + '</div>' : '') + '</div>' +
       '<button type="button" class="del" data-act="shop-del" aria-label="' + esc(it.name) + 'を削除">×</button></li>';
   }
+
+  // ---------- 登録したあとの書き直し（買い物・やること。文字を押すと、その行が入力欄になる） ----------
+  var editing = null; // { kind: 'shop'|'task', id, vals: {欄の名前: 入力中の値} }（入力中に自動更新で描き直しても消えないように）
+  function editVal(name, fallback) {
+    return editing && editing.vals && name in editing.vals ? editing.vals[name] : fallback;
+  }
+  function editButtons(saveAct) {
+    return '<div class="row-btns"><button type="button" class="btn" data-act="' + saveAct + '">保存</button>' +
+      '<button type="button" class="btn-sub" data-act="edit-cancel">やめる</button></div>';
+  }
+
+  function shopEditor(it) {
+    var store = editVal('store', it.store || '');
+    var stores = (data.stores || []).slice();
+    if (store && stores.indexOf(store) === -1) stores.push(store);
+    return '<li class="item editing" data-id="' + esc(it.id) + '"><div class="edit-box">' +
+      '<input type="text" data-edit="name" value="' + esc(editVal('name', it.name)) + '" maxlength="100" aria-label="品目" enterkeyhint="done">' +
+      '<select data-edit="store" aria-label="お店">' + [''].concat(stores).map(function (s) {
+        return '<option value="' + esc(s) + '"' + (s === store ? ' selected' : '') + '>お店：' + esc(s || '指定なし') + '</option>';
+      }).join('') + '</select>' + editButtons('shop-edit-save') + '</div></li>';
+  }
+
+  function taskEditor(it) {
+    var who2 = editVal('assignee', it.assignee || '');
+    return '<li class="item editing" data-id="' + esc(it.id) + '"><div class="edit-box">' +
+      '<input type="text" data-edit="text" value="' + esc(editVal('text', it.text)) + '" maxlength="100" aria-label="やることの内容" enterkeyhint="done">' +
+      '<div class="row2"><select data-edit="assignee" aria-label="担当">' + [''].concat(data.members).map(function (m) {
+        return '<option value="' + esc(m) + '"' + (m === who2 ? ' selected' : '') + '>担当：' + esc(m || 'なし') + '</option>';
+      }).join('') + '</select>' +
+      '<input type="date" data-edit="due" value="' + esc(editVal('due', it.due || '')) + '" aria-label="期限（任意）"></div>' +
+      editButtons('task-edit-save') + '</div></li>';
+  }
+
+  function openEditor(kind, id) {
+    if (!requireWho()) return;
+    var it = find(kind === 'shop' ? data.shopping : data.tasks, id);
+    if (!it || it.tmp) return;
+    editing = { kind: kind, id: id, vals: {} };
+    if (kind === 'shop') renderShop(); else renderTask();
+    var input = document.querySelector('.item.editing input[type="text"]');
+    if (input) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+  }
+
+  function closeEditor() {
+    var kind = editing && editing.kind;
+    editing = null;
+    if (kind === 'shop') renderShop(); else if (kind === 'task') renderTask();
+  }
+
+  function editedValues() {
+    var out = {};
+    Array.prototype.forEach.call(document.querySelectorAll('.item.editing [data-edit]'), function (el) { out[el.dataset.edit] = el.value; });
+    return out;
+  }
+
+  function saveShopEdit() {
+    var it = editing && find(data.shopping, editing.id);
+    if (!it) { closeEditor(); return; }
+    var v = editedValues();
+    var name = String(v.name || '').replace(/\s+/g, ' ').trim();
+    var store = v.store || '';
+    if (!name) { toast('品目を入力してください'); return; }
+    var dup = data.shopping.some(function (x) { return x.id !== it.id && norm(x.name) === norm(name); });
+    if (dup) { toast('「' + name + '」はもう買う物リストにあります'); return; }
+    var prev = { name: it.name, store: it.store || '' };
+    editing = null;
+    if (name === prev.name && store === prev.store) { renderShop(); return; }
+    mutate('editShopping', [it.id, name, store, who], function () { it.name = name; it.store = store; });
+    toast('「' + name + '」に書き直しました', '元に戻す', function () {
+      mutate('editShopping', [it.id, prev.name, prev.store, who], function () {
+        var x = find(data.shopping, it.id);
+        if (x) { x.name = prev.name; x.store = prev.store; }
+      });
+    });
+  }
+
+  function saveTaskEdit() {
+    var it = editing && find(data.tasks, editing.id);
+    if (!it) { closeEditor(); return; }
+    var v = editedValues();
+    var text = String(v.text || '').replace(/\s+/g, ' ').trim();
+    var assignee = v.assignee || '';
+    var due = v.due || '';
+    if (!text) { toast('内容を入力してください'); return; }
+    var prev = { text: it.text, assignee: it.assignee || '', due: it.due || '' };
+    editing = null;
+    if (text === prev.text && assignee === prev.assignee && due === prev.due) { renderTask(); return; }
+    mutate('editTask', [it.id, text, assignee, due, who], function () { it.text = text; it.assignee = assignee; it.due = due; });
+    toast('「' + text + '」に書き直しました', '元に戻す', function () {
+      mutate('editTask', [it.id, prev.text, prev.assignee, prev.due, who], function () {
+        var x = find(data.tasks, it.id);
+        if (x) { x.text = prev.text; x.assignee = prev.assignee; x.due = prev.due; }
+      });
+    });
+  }
+
+  // 入力中の値を覚えておく（1分ごとの自動更新で描き直しても消えないように）
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+    if (!editing || !el.dataset || !el.dataset.edit) return;
+    editing.vals[el.dataset.edit] = el.value;
+  });
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (!editing || !el.dataset || !el.dataset.edit) return;
+    editing.vals[el.dataset.edit] = el.value;
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter' || !editing || !e.target.dataset || e.target.dataset.edit === undefined || e.target.tagName !== 'INPUT') return;
+    if (e.isComposing) return; // 日本語の変換中の Enter は確定なので保存しない
+    e.preventDefault();
+    if (editing.kind === 'shop') saveShopEdit(); else saveTaskEdit();
+  });
 
   function dueInfo(due) {
     var n = diffDays(data.today, due);
@@ -1156,13 +1282,15 @@
   }
 
   function taskItem(it) {
+    if (editing && editing.kind === 'task' && editing.id === it.id) return taskEditor(it);
     var meta = '';
     if (it.due) { var d = dueInfo(it.due); meta += '<span class="pill ' + d.cls + '">' + esc(d.text) + '</span>'; }
     meta += '<span>' + (it.assignee ? '担当：' + esc(it.assignee) : '担当なし') + '</span>';
     if (it.by) meta += '<span>' + esc(it.by) + ' · ' + esc(it.at ? md(it.at) : '') + '</span>';
     return '<li class="item' + (it.tmp ? ' tmp' : '') + '" data-id="' + esc(it.id) + '">' +
       '<button type="button" class="check" data-act="task-done" aria-label="' + esc(it.text) + 'を完了"><span></span></button>' +
-      '<div class="body"><div class="name">' + esc(it.text) + '</div><div class="meta">' + meta + '</div></div>' +
+      '<div class="body"' + (it.tmp ? '' : ' data-act="item-edit" data-kind="task"') + '><div class="name">' + esc(it.text) +
+      (it.tmp ? '' : '<span class="edit-hint" aria-hidden="true">✎</span>') + '</div><div class="meta">' + meta + '</div></div>' +
       '<button type="button" class="del" data-act="task-del" aria-label="' + esc(it.text) + 'を削除">×</button></li>';
   }
 
@@ -2279,6 +2407,10 @@
           requireWho();
         }
         break;
+      case 'item-edit': openEditor(b.dataset.kind, id); break;
+      case 'shop-edit-save': saveShopEdit(); break;
+      case 'task-edit-save': saveTaskEdit(); break;
+      case 'edit-cancel': closeEditor(); break;
       case 'shop-done': finishShop(id, '済', '済にしました'); break;
       case 'shop-del': finishShop(id, '削除', '削除しました'); break;
       case 'task-done': finishTask(id, '済', '完了にしました'); break;
@@ -2512,6 +2644,14 @@
         }, lists()));
       },
       logTiming: function () { return later({}); },
+      editShopping: function (id, name, store) {
+        db.shopping.forEach(function (x) { if (x.id === id && x.st === '未') { x.name = name; x.store = store; } });
+        return later(lists());
+      },
+      editTask: function (id, text, assignee, due) {
+        db.tasks.forEach(function (x) { if (x.id === id && x.st === '未') { x.text = text; x.assignee = assignee; x.due = due; } });
+        return later(lists());
+      },
       checkItem: function (listId, item, checked, w) {
         var L = cls.filter(function (x) { return x.id === listId; })[0];
         var r = activeRun(listId);
