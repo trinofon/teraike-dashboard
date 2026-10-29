@@ -417,6 +417,7 @@
 </head>
 <body data-tab="cal">
   <div id="previewNote" class="preview" hidden>プレビュー表示です（サンプルのデータ。保存はされません）</div>
+  <div id="staleNote" class="preview" hidden></div>
 
   <header class="top">
     <div>
@@ -441,6 +442,7 @@
         <div class="warn" id="calError" hidden></div>
         <div class="cal-list" id="calList"><div class="empty">読み込み中…</div></div>
         <div class="cal-grid" id="calGrid"></div>
+        <div class="muted" id="loadInfo" style="margin-top:8px" hidden></div>
       </div>
       <!-- リンク集とメモ（予定のカードの「🔗 リンク集」で入れ替わる） -->
       <div class="card" id="linksCard" hidden></div>
@@ -657,27 +659,83 @@
     return Mock[fn].apply(null, args);
   }
 
+  // ---------- 前回のデータを先に出す（開いた瞬間に表示するため。2026-10-29） ----------
+  // 最新のデータを読み込めたら、この端末に取っておく。次に開いたときは、まずそれを出して「前回の内容」と知らせ、
+  // 裏で最新を読み込んで入れ替える。取っておくのは家族のURLで開いた端末だけで、3日より古いものは使わない
+  var CACHE_KEY = 'dataCache';
+  var stale = false;   // いま出しているのが「前回の内容」か
+  var staleAt = 0;
+  var firstLoad = true;
+  function cacheId() { return GAS ? 'gas' : CFG ? CFG.api : ''; }
+  function saveDataCache(d) {
+    if (!LIVE || !cacheId()) return;
+    mem.set(CACHE_KEY, JSON.stringify({ api: cacheId(), at: Date.now(), d: d }));
+  }
+  function readDataCache() {
+    try {
+      var c = JSON.parse(mem.get(CACHE_KEY) || 'null');
+      return c && c.d && c.api === cacheId() && Date.now() - c.at < 3 * DAY ? c : null;
+    } catch (e) { return null; }
+  }
+  function showStale(msg) {
+    var el = $('#staleNote');
+    if (!stale) { el.hidden = true; return; }
+    var t = new Date(staleAt);
+    el.textContent = '前回（' + (t.getMonth() + 1) + '/' + t.getDate() + ' ' + pad(t.getHours()) + ':' + pad(t.getMinutes()) + '）の内容です。' +
+      (msg || '最新を読み込んでいます…');
+    el.hidden = false;
+  }
+  function openStartList(d) { // URLの list=… で指定されたチェックリストを開く
+    if (!startList) return;
+    var L = (d.checklists || []).filter(function (x) { return norm(x.name) === norm(startList); })[0];
+    startList = '';
+    if (L) { checkView = { mode: 'list', id: L.id }; setTab('check'); }
+  }
+
   function load(force) {
-    if (pending) return;
+    if (pending) { if (stale) needReload = true; return; }
     var seq = mutSeq;
+    var t0 = Date.now();
     $('#refreshBtn').classList.add('spin');
     return call('getData', !!force).then(function (d) {
       // 読み込み中に操作（書き込み）があったら、この返事は操作の前の古い中身なので使わない（操作の返事を優先）
-      if (pending || (data && seq !== mutSeq)) return;
-      data = d;
-      clockOffset = ts(d.now) - Date.now();
-      if (startList) { // URLの list=… で指定されたチェックリストを開く
-        var L = (d.checklists || []).filter(function (x) { return norm(x.name) === norm(startList); })[0];
-        startList = '';
-        if (L) { checkView = { mode: 'list', id: L.id }; setTab('check'); }
+      if (pending || (data && seq !== mutSeq)) {
+        if (stale) { if (pending) needReload = true; else setTimeout(function () { load(force); }, 0); } // 前回の内容のままにしない
+        return;
       }
+      var clientMs = Date.now() - t0;
+      data = d;
+      stale = false;
+      showStale();
+      clockOffset = ts(d.now) - Date.now();
+      saveDataCache(d);
+      openStartList(d);
       render();
+      showLoadInfo(clientMs, d.timing);
+      if (LIVE && (firstLoad || force) && d.timing) { // 開いたとき・↻のときにかかった時間を記録（表示が遅い原因を調べるため）
+        var dev = /iPhone/.test(navigator.userAgent) ? 'iPhone' : /iPad|Android/.test(navigator.userAgent) ? 'タブレット等' : 'PC';
+        call('logTiming', who, dev, clientMs, d.timing).catch(function () { /* 記録できなくても困らない */ });
+      }
+      firstLoad = false;
       if (!who) openWho();
     }).catch(function (e) {
-      toast(errMsg(e));
+      if (stale) showStale('最新を読み込めませんでした（↻ で読み込み直し）'); else toast(errMsg(e));
     }).then(function () {
       $('#refreshBtn').classList.remove('spin');
     });
+  }
+
+  // 親だけ：読み込みにかかった時間を予定の下に出す（どこが重いかを見るため）。名前を選び直したときも出し直す
+  var lastTiming = null;
+  function showLoadInfo(clientMs, t) {
+    if (t) lastTiming = { clientMs: clientMs, t: t };
+    else if (lastTiming) { clientMs = lastTiming.clientMs; t = lastTiming.t; }
+    var el = $('#loadInfo');
+    if (!t || !isParent()) { el.hidden = true; return; }
+    var s = function (ms) { return (Math.round(ms / 100) / 10).toFixed(1); };
+    el.textContent = '読み込み ' + s(clientMs) + '秒（サーバー ' + s(t.total) + '秒：予定 ' + s(t.calendar) + '秒' +
+      (t.calendarCached ? '・覚えていた' : '・読み直し') + '、シート ' + s(t.sheets) + '秒。通信・起動待ち ' + s(clientMs - t.total) + '秒）';
+    el.hidden = false;
   }
 
   // 書き込みは順番に送る（「済」→「元に戻す」の順序が入れ替わらないように）。
@@ -707,6 +765,7 @@
     if (pending) return;
     var buf = serverBuf;
     serverBuf = null;
+    if (stale) needReload = true; // 前回の内容を出している間に操作したときは、全部を読み込み直す
     if (needReload) {
       needReload = false;
       // 画面を離れるときに送った分（下の ckBeacon）があれば、サーバーが書き終わるのを少し待ってから読み込む
@@ -851,6 +910,7 @@
     $('#todayLabel').textContent = parse(t).getUTCMonth() + 1 + '月' + parse(t).getUTCDate() + '日（' + DOW[dow(t)] + '）';
     $('#whoName').textContent = who || '名前';
     renderCal();
+    showLoadInfo();
     renderShop();
     renderTask();
     renderCheck();
@@ -1252,6 +1312,8 @@
       // 送り終わるまでは、ロックの様子もまだ古いので、代わりに「保存中」を出す
       html += '<div class="banner old">⏳ 保存中…送り終わるまで、この画面のままにしてください' +
         (lk ? '<br><span style="font-weight:400">保存できると、ロックの様子がここに出ます。</span>' : '') + '</div>';
+    } else if (lk && stale) {
+      html += '<div class="banner old">⏳ ロックの様子を確かめています…</div>'; // 前回の内容のロックの様子は古いので出さない
     } else if (lk) {
       html += '<div class="banner ' + (lk.locked ? 'lock' : 'ok') + '">' + esc(lockText(lk)) +
         (lk.locked ? '<br><span style="font-weight:400">このリストを終えると、アプリが使えるようになります。</span>' : '') +
@@ -2446,8 +2508,10 @@
           notes: JSON.parse(JSON.stringify(notes)),
           lock: mockLock(),
           checklists: JSON.parse(JSON.stringify(checklistsOut())),
+          timing: { total: 180, settings: 20, calendar: 120, calendarCached: false, sheets: 40 }, // サンプルの時間
         }, lists()));
       },
+      logTiming: function () { return later({}); },
       checkItem: function (listId, item, checked, w) {
         var L = cls.filter(function (x) { return x.id === listId; })[0];
         var r = activeRun(listId);
@@ -2638,6 +2702,18 @@
     if (bootClubs.length) renderClubs(bootClubs);
   }
   setTab(wantTab);
+  if (LIVE) { // 前回のデータがあれば、読み込みを待たずに出す
+    var cached = readDataCache();
+    if (cached) {
+      data = cached.d;
+      data.today = localToday(); // 日付が変わっていても、予定は今日から出す
+      stale = true;
+      staleAt = cached.at;
+      openStartList(data);
+      render();
+      showStale();
+    }
+  }
   if (LIVE || PREVIEW) {
     load(false);
   } else {
