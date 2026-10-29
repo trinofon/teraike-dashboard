@@ -634,8 +634,16 @@
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: JSON.stringify({ fn: fn, key: KEY, args: args }),
+      }).catch(function () {
+        var err = new Error('通信できませんでした。電波を確かめてください。');
+        err.net = true; // 通信そのものの失敗（やり直せば届くことがある）
+        throw err;
       }).then(function (r) {
-        if (!r.ok) throw new Error('通信に失敗しました（' + r.status + '）。');
+        if (!r.ok) {
+          var err = new Error('通信に失敗しました（' + r.status + '）。');
+          err.net = r.status >= 500 || r.status === 429;
+          throw err;
+        }
         return r.text();
       }).then(function (text) {
         var res;
@@ -676,6 +684,7 @@
   // サーバーの返事は、続けて押した分がすべて終わってから画面に当てる。途中の返事をすぐ当てると、
   // まだ送っていない分のチェックが画面から消え、それを見てもう一度押すと「外す」が送られてしまうため（2026-10-19 スマホで多発）
   function mutate(fn, args, optimistic) {
+    ckFlushAll(); // ためているチェックを先に順番待ちに入れる（「完了」→「元に戻す」の順番が入れ替わらないように）
     pending++;
     mutSeq++;
     if (optimistic) { optimistic(); render(); }
@@ -688,12 +697,24 @@
       needReload = true;
     }).then(function () {
       pending--;
-      if (pending) return;
-      var buf = serverBuf;
-      serverBuf = null;
-      if (needReload) { needReload = false; load(); } else { if (buf) Object.assign(data, buf); render(); }
+      settle();
     });
     return queue;
+  }
+
+  // 書き込みが全部終わったら、ためておいたサーバーの返事を画面に当てる（失敗があったときは読み込み直す）
+  function settle() {
+    if (pending) return;
+    var buf = serverBuf;
+    serverBuf = null;
+    if (needReload) {
+      needReload = false;
+      // 画面を離れるときに送った分（下の ckBeacon）があれば、サーバーが書き終わるのを少し待ってから読み込む
+      if (beaconAt && Date.now() - beaconAt < 5000) setTimeout(function () { load(); }, 2000); else load();
+    } else {
+      if (buf) Object.assign(data, buf);
+      render();
+    }
   }
 
   function requireWho() {
@@ -1127,7 +1148,8 @@
     if (L.active) return { mode: 'active', run: L.active, items: L.active.items, checks: L.active.checks };
     var last = L.last;
     var d = dismissed[L.id];
-    var closed = !!(d && last && (last.id === d.id || ts(last.endedAt) <= d.t));
+    // 閉じたのと同じ回だけを閉じたままにする（2026-10-29から、画面とサーバーで回のIDが同じになったので、時刻のずれは見ない）
+    var closed = !!(d && last && last.id === d.id);
     if (last && last.status === '完了' && !closed && ts(nowStr()) - ts(last.endedAt) < 30 * 60000) {
       return { mode: 'done', run: last, items: last.items, checks: last.checks };
     }
@@ -1226,7 +1248,11 @@
       '<div class="ck-title"><h3>' + esc(L.name) + '<span class="cnt">' + n + '/' + v.items.length + '</span></h3>' +
       '<div class="head-actions">' + actions + '</div></div>';
     var lk = lockOf(L);
-    if (lk) {
+    if (ckSaving(L.id)) {
+      // 送り終わるまでは、ロックの様子もまだ古いので、代わりに「保存中」を出す
+      html += '<div class="banner old">⏳ 保存中…送り終わるまで、この画面のままにしてください' +
+        (lk ? '<br><span style="font-weight:400">保存できると、ロックの様子がここに出ます。</span>' : '') + '</div>';
+    } else if (lk) {
       html += '<div class="banner ' + (lk.locked ? 'lock' : 'ok') + '">' + esc(lockText(lk)) +
         (lk.locked ? '<br><span style="font-weight:400">このリストを終えると、アプリが使えるようになります。</span>' : '') +
         (isParent() ? '<div class="row-btns" style="margin-top:8px">' + (lk.locked
@@ -1312,6 +1338,91 @@
     window.scrollTo(0, 0);
   }
 
+  // ---------- チェックの書き込み（まとめて送る・失敗したらやり直す・画面を離れるときは残りを送る） ----------
+  // 2026-10-29：1つずつ順番に送っていたころ、スマホでは1回に1〜3秒かかり、「今回はこれでOK」が届く前に画面を離れると
+  // 残りが届かず、ロックが解けないまま途中までのチェックに戻ることがあった。そこで、
+  //  ・押した分は少しためて、1回の通信にまとめて送る（サーバーの syncChecklist）
+  //  ・通信が切れたら、少し待ってやり直す（帰宅直後はWi-Fiが不安定）
+  //  ・「今回はこれでOK」は、画面に出ているチェックを全部付けて送る（前の分が届いていなくても、これ1回で正しくなる）
+  //  ・画面を離れるとき、まだ送っていない分は、ブラウザに頼んで送ってもらう（sendBeacon）
+  //  ・送り終わるまで「保存中…」を出す
+  var ckOut = {};   // リストID → { runId, changes: {項目: true/false}, finish, timer, queued, held }
+  var beaconAt = 0; // 画面を離れるときに送った時刻
+  function newRunId() { return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function ckSaving(listId) { return !!ckOut[listId]; }
+
+  // 送る分を足して、少し待ってから送る（続けて押した分を1回にまとめる）
+  function ckSend(listId, delay) {
+    var s = ckOut[listId] || (ckOut[listId] = { runId: '', changes: {}, finish: false, timer: null, queued: false, held: false });
+    if (!s.held) { s.held = true; pending++; } // 送り終わるまで、読み込みの返事で画面を戻さない
+    mutSeq++;
+    clearTimeout(s.timer);
+    s.timer = setTimeout(function () { ckFlush(listId); }, delay);
+    return s;
+  }
+
+  function ckFlushAll() {
+    Object.keys(ckOut).forEach(function (id) { if (ckOut[id].timer) ckFlush(id); });
+  }
+
+  // 順番待ちの列（queue）に入れる。自分の番が来たときに、そこまでにたまった分をまとめて送る
+  function ckFlush(listId) {
+    var s = ckOut[listId];
+    if (!s) return;
+    clearTimeout(s.timer);
+    s.timer = null;
+    if (s.queued) return;
+    s.queued = true;
+    queue = queue.then(function () {
+      s.queued = false;
+      var changes = s.changes, finish = s.finish;
+      if (!Object.keys(changes).length && !finish) return;
+      s.changes = {};
+      s.finish = false;
+      return ckPost(listId, s.runId, changes, finish, 0).then(function (lists) {
+        serverBuf = Object.assign(serverBuf || {}, lists);
+      }).catch(function (e) {
+        toast(errMsg(e) + '（チェックを保存できませんでした）');
+        needReload = true;
+      });
+    }).then(function () {
+      if (s.timer || s.queued || Object.keys(s.changes).length || s.finish) return; // まだ送る分がある
+      if (ckOut[listId] === s) delete ckOut[listId];
+      if (s.held) { s.held = false; pending--; }
+      if (checkView.id === listId) renderCheck();
+      settle();
+    });
+  }
+
+  // 通信そのものが失敗したときは、少しずつ間をあけて5回までやり直す
+  function ckPost(listId, runId, changes, finish, tries) {
+    return call('syncChecklist', listId, runId, changes, finish, who).catch(function (e) {
+      if (!e.net || tries >= 5) throw e;
+      return wait(Math.min(2000 * (tries + 1), 8000)).then(function () {
+        return ckPost(listId, runId, changes, finish, tries + 1);
+      });
+    });
+  }
+
+  // 画面を離れるとき（ホームに戻る・ほかのアプリを開く）：まだ送っていない分を、ブラウザに送ってもらう
+  function ckBeacon() {
+    if (!API || !navigator.sendBeacon) return;
+    Object.keys(ckOut).forEach(function (listId) {
+      var s = ckOut[listId];
+      if (!Object.keys(s.changes).length && !s.finish) return;
+      var body = JSON.stringify({ fn: 'syncChecklist', key: KEY, args: [listId, s.runId, s.changes, s.finish, who] });
+      if (navigator.sendBeacon(API, new Blob([body], { type: 'text/plain;charset=utf-8' }))) {
+        s.changes = {};
+        s.finish = false;
+        beaconAt = Date.now();
+        needReload = true; // 戻ってきたら、サーバーの最新を読み込む
+      }
+    });
+  }
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') ckBeacon(); });
+  window.addEventListener('pagehide', ckBeacon);
+
   function toggleCheck(item) {
     if (!requireWho()) return;
     var L = findList(checkView.id);
@@ -1320,22 +1431,25 @@
     if (v.mode === 'done') return;
     var checked = !v.checks[item];
     var at = nowStr();
-    mutate('checkItem', [L.id, item, checked, who], function () {
-      if (!L.active) {
-        L.active = { id: 'tmp', listId: L.id, listName: L.name, status: '実施中', startedBy: who, startedAt: at,
-          endedBy: '', endedAt: '', items: L.items.slice(), checks: {} };
-      }
-      var r = L.active;
-      if (checked) r.checks[item] = { by: who, at: at }; else delete r.checks[item];
-      if (r.items.every(function (x) { return r.checks[x]; })) {
-        L.last = Object.assign({}, r, { status: '完了', endedBy: who, endedAt: at });
-        L.active = null;
-        toast('「' + L.name + '」完了！おつかれさまです', '元に戻す', function () { reopenList(L.id, item); });
-      } else if (!Object.keys(r.checks).length) {
-        L.active = null;
-      }
-      history = null;
-    });
+    if (!L.active) {
+      L.active = { id: newRunId(), listId: L.id, listName: L.name, status: '実施中', startedBy: who, startedAt: at,
+        endedBy: '', endedAt: '', items: L.items.slice(), checks: {} };
+    }
+    var r = L.active;
+    if (checked) r.checks[item] = { by: who, at: at }; else delete r.checks[item];
+    var s = ckSend(L.id, 400);
+    s.runId = r.id;
+    s.changes[item] = checked;
+    if (r.items.every(function (x) { return r.checks[x]; })) {
+      L.last = Object.assign({}, r, { status: '完了', endedBy: who, endedAt: at });
+      L.active = null;
+      ckFlush(L.id); // 全部チェックしたら、待たずに送る
+      toast('「' + L.name + '」完了！おつかれさまです', '元に戻す', function () { reopenList(L.id, item); });
+    } else if (!Object.keys(r.checks).length) {
+      L.active = null;
+    }
+    history = null;
+    render();
   }
 
   // 完了後の「新しく始める」：完了の表示を閉じて、空のリストにする（記録はそのまま残る）
@@ -1344,8 +1458,7 @@
     if (!L) return;
     var v = viewOf(L);
     if (v.mode !== 'done') return;
-    // 画面での完了時刻とサーバーの記録が1分ずれても閉じたままにする
-    dismissed[L.id] = { id: v.run.id, t: ts(v.run.endedAt) + 60000 };
+    dismissed[L.id] = { id: v.run.id };
     renderCheck();
   }
 
@@ -1356,11 +1469,16 @@
     if (!L || !L.active) return;
     var run = L.active;
     var at = nowStr();
-    mutate('finishChecklist', [L.id, who], function () {
-      L.last = Object.assign({}, run, { status: '完了', endedBy: who, endedAt: at });
-      L.active = null;
-      history = null;
-    });
+    // 画面に出ているチェックを全部付けて送る（前に送った分が届いていなくても、これ1回で正しくなる）。待たずに送る
+    var s = ckSend(L.id, 0);
+    s.runId = run.id;
+    run.items.forEach(function (x) { if (run.checks[x]) s.changes[x] = true; });
+    s.finish = true;
+    ckFlush(L.id);
+    L.last = Object.assign({}, run, { status: '完了', endedBy: who, endedAt: at });
+    L.active = null;
+    history = null;
+    render();
     toast('「' + L.name + '」を、今回はこれでOKにしました', '元に戻す', function () { reopenList(L.id, ''); });
   }
 
@@ -2341,6 +2459,32 @@
         if (checked) r.checks[item] = { by: w, at: nowLocal() }; else delete r.checks[item];
         if (r.items.every(function (x) { return r.checks[x]; })) { r.status = '完了'; r.endedBy = w; r.endedAt = nowLocal(); }
         else if (!Object.keys(r.checks).length) { r.status = '中断'; r.endedBy = w; r.endedAt = nowLocal(); }
+        return cl();
+      },
+      // サーバーの syncChecklist と同じ動き：まとめて書き込み、finish なら「これでOK」で完了。終わった回への知らせは無視
+      syncChecklist: function (listId, runId, changes, finish, w) {
+        if (window.__mockFail && window.__mockFail-- > 0) { // プレビューで「通信の失敗」を試すため
+          var err = new Error('通信できませんでした。電波を確かめてください。');
+          err.net = true;
+          return new Promise(function (res, rej) { setTimeout(function () { rej(err); }, 150); });
+        }
+        var L = cls.filter(function (x) { return x.id === listId; })[0];
+        var known = runs.filter(function (x) { return x.id === runId; })[0];
+        if (known && known.status !== '実施中') return cl();
+        var entries = Object.keys(changes).map(function (k) { return [k, changes[k] === true]; });
+        var r = activeRun(listId);
+        if (!r) {
+          if (!entries.some(function (e) { return e[1]; })) return cl();
+          r = { id: known || !runId ? 'r' + (seq++) : runId, listId: listId, listName: L.name, status: '実施中', startedBy: w, startedAt: nowLocal(), endedBy: '', endedAt: '', items: L.items.slice(), checks: {} };
+          runs.push(r);
+        }
+        entries.forEach(function (e) {
+          if (r.items.indexOf(e[0]) === -1) return;
+          if (e[1]) { if (!r.checks[e[0]]) r.checks[e[0]] = { by: w, at: nowLocal() }; } else delete r.checks[e[0]];
+        });
+        var n = Object.keys(r.checks).length;
+        if (r.items.every(function (x) { return r.checks[x]; }) || (finish && n)) { r.status = '完了'; r.endedBy = w; r.endedAt = nowLocal(); }
+        else if (!n) { r.status = '中断'; r.endedBy = w; r.endedAt = nowLocal(); }
         return cl();
       },
       resetChecklist: function (listId, w) {
